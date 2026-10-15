@@ -315,6 +315,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(a_preshuffled),
         int(m_align),
     )
+    ep_scale_spec = (
+        int(stage2_scatter.combine_scale_offset) if enable_ep_scatter else 0,
+        int(stage2_scatter.combine_scale_slots) if enable_ep_scatter else 0,
+    )
     _run_compiled(
         launch_gemm_a8w4_tdm,
         out.view(-1),
@@ -338,6 +342,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
+        *ep_scale_spec,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -345,6 +350,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            ep_scale_spec,
         ),
     )
     return out
