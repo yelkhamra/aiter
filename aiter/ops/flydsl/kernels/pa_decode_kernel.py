@@ -171,6 +171,7 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    output_strides_match: bool = True,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -201,13 +202,15 @@ def compile_pa_decode_tile(
     ``trans_k=False`` is not implemented.
     gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
     With ``direct_output`` a gfx1250 plan writes final output when sinks are
-    absent and query/output strides match: one-partition plans directly, and
+    absent: one-partition plans directly, and
     other plans of at most ``MERGE_PARTITIONS`` partitions per sequence by
     merging in each sequence's last-arriving CTA. Other tasks write packed
     partials for the shared reducer, which applies sinks once. A positive
     ``cluster_merge`` P instead merges each sequence's tasks within a cluster
     of P CTAs (see ``compile_gfx1250_pa_decode``); plans must give every
     sequence at most P tasks.
+    ``output_strides_match`` reuses query strides for final stores when true;
+    otherwise the gfx1250 launch takes independent output row/head strides.
 
     Pages past the sequence are pinned to block 0 and the unwritten tail of the
     last owned page is read as is. On gfx942/gfx950 with ``mask_unowned_kv``
@@ -253,6 +256,7 @@ def compile_pa_decode_tile(
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
+            output_strides_match=output_strides_match,
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -500,6 +504,7 @@ def compile_gfx1250_pa_decode(
     query_splits=1,
     merge_partitions=False,
     cluster_merge=0,
+    output_strides_match=True,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -515,6 +520,10 @@ def compile_gfx1250_pa_decode(
     """
     if query_splits not in (1, 2, 4) or query_length % query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
+    # Reducer-fed tile kernels never access final output or its strides.
+    output_strides_match = output_strides_match or not (
+        direct_output or merge_partitions or cluster_merge
+    )
     t = Gfx1250Traits(
         head_dim,
         query_group_size,
@@ -530,6 +539,7 @@ def compile_gfx1250_pa_decode(
         query_splits,
         merge_partitions,
         cluster_merge,
+        output_strides_match,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -576,8 +586,10 @@ def compile_gfx1250_pa_decode(
         merge_partitions=merge_partitions,
         cluster_merge=cluster_merge,
     )
+    if not output_strides_match:
+        kernel_name += "_ostrides"
 
-    # Every argument that reducer-fed and direct-output kernels read fits in
+    # When output strides match, arguments read by reducer-fed/direct kernels fit in
     # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
     # the merge-only arguments.
     @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
@@ -603,8 +615,12 @@ def compile_gfx1250_pa_decode(
         reduce_info: fx.Pointer,
         output: fx.Pointer,
         counters: fx.Pointer,
+        so_row: fx.Int32,
+        so_head: fx.Int32,
     ):
         _ = tag
+        stride_o_row = sq_row if output_strides_match else so_row
+        stride_o_head = sq_head if output_strides_match else so_head
 
         def zero_output(seq, dst):
             # Empty sequences have no attention mass; clear this CTA's rows.
@@ -618,12 +634,12 @@ def compile_gfx1250_pa_decode(
                     row = row + (kv_query % t.query_splits) * t.rows
                     offset = (
                         (fx.Int64(seq) * t.query_length + row // t.query_group_size)
-                        * sq_row
+                        * stride_o_row
                         + (
                             (kv_query // t.query_splits) * t.query_group_size
                             + row % t.query_group_size
                         )
-                        * sq_head
+                        * stride_o_head
                         + d
                     )
                     rows[offset] = t.q_dtype(0.0)
@@ -680,6 +696,7 @@ def compile_gfx1250_pa_decode(
             )
             # Packed partials are [KV heads, capacity, rows] by task slot.
             ctx.task_slot, ctx.capacity = task_slot, capacity
+            ctx.stride_o_row, ctx.stride_o_head = stride_o_row, stride_o_head
             ctx.n_kv = kv_heads
             if const_expr(t.merge_partitions):
                 # Issued early: only the epilogue reads the sequence's tasks.
@@ -717,7 +734,7 @@ def compile_gfx1250_pa_decode(
             # Every CTA of a cluster reaches its barrier exactly once.
             if count > 1:
                 merge = Gfx1250ClusterMerge(
-                    t, pmax, psum, pout, output, sq_row, sq_head
+                    t, pmax, psum, pout, output, stride_o_row, stride_o_head
                 )
                 merge.run(seq, part, first, count, capacity)
             elif (count == 0) & (part == 0):
@@ -746,6 +763,8 @@ def compile_gfx1250_pa_decode(
         output: fx.Pointer,
         reduce_info: fx.Pointer,
         counters: fx.Pointer,
+        so_row: fx.Int32,
+        so_head: fx.Int32,
         stream: fx.Stream,
     ):
         _ = tag
@@ -776,6 +795,8 @@ def compile_gfx1250_pa_decode(
             reduce_info,
             output,
             counters,
+            so_row,
+            so_head,
             value_attrs=(
                 {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
                 if t.cluster_merge

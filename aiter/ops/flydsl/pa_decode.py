@@ -249,7 +249,7 @@ def pa_decode(
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
-    sinks are absent and query/output strides match, a cap of one writes output
+    sinks are absent, a cap of one writes output
     directly. So do plans with one task slot per sequence (capacity equal to
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
@@ -653,7 +653,6 @@ def pa_decode(
     direct_output = (
         arch == "gfx1250"
         and sinks is None
-        and output.stride() == query.stride()
         and (
             num_partitions == 1
             or (
@@ -684,7 +683,6 @@ def pa_decode(
             arch == "gfx1250"
             and not direct_output
             and sinks is None
-            and output.stride() == query.stride()
             and 2 <= max_partitions <= CLUSTER_PARTITIONS
             and num_seqs * max_partitions
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
@@ -727,6 +725,7 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            output_strides_match=output.stride() == query.stride(),
         )
 
     total_rows = query_length * query_group_size
@@ -793,6 +792,8 @@ def pa_decode(
                 if merged
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
+            int(output.stride(0)),
+            int(output.stride(1)),
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)

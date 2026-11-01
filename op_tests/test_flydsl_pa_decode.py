@@ -14,6 +14,7 @@ import torch
 
 from aiter import per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import checkAllclose
 
 
 @pytest.fixture
@@ -163,35 +164,44 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("output_layout", ["same", "padded", "heads_first"])
 @pytest.mark.parametrize(
-    "mode,dim,scratch_offset",
+    "mode,dim,scratch_offset,query_length",
     [
-        ("last", 128, 0),
-        ("last", 128, 1),
-        ("last", 128, 2),
-        ("last", 128, 3),
-        ("cluster", 128, 1),
-        ("cluster", 384, 1),
-        ("reducer", 128, 1),
+        ("single", 128, 1, 3),
+        ("last", 128, 0, 3),
+        ("last", 128, 1, 1),
+        ("last", 128, 2, 1),
+        ("last", 128, 3, 1),
+        ("cluster", 128, 1, 3),
+        ("cluster", 384, 1, 1),
+        ("reducer", 128, 1, 1),
     ],
 )
 def test_pa_decode_merge_alignment(
-    device, monkeypatch, mode, dim, scratch_offset, dtype
+    device,
+    monkeypatch,
+    mode,
+    dim,
+    scratch_offset,
+    query_length,
+    dtype,
+    output_layout,
 ):
     """Offset scratch and odd query/output strides retain element alignment.
 
     Last-arriver atomics require eight-byte scratch alignment; unaligned
     scratch falls back to the cluster merge. Cluster loads and final stores
-    support the otherwise valid offset views directly, as does the reducer,
-    which a -inf sink selects without adding attention mass.
+    support the otherwise valid offset views directly, as does the reducer.
+    Sinks still use that fallback, including +/-inf and finite values.
     """
     if get_gfx_runtime() != "gfx1250":
         pytest.skip("gfx1250 tile-kernel partition merges")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    lengths = (1024,) if mode == "cluster" else (1024, 0, 0, 0)
+    lengths = (1024, 17, 0) if mode == "cluster" else (1024, 17, 0, 0)
     page, group = 16, 16
     query, key, value, table, context = _make_inputs(
-        1, 1, group, dim, page, dtype, "random", device, lengths
+        query_length, 1, group, dim, page, dtype, "random", device, lengths
     )
     # Both the base address and each head's stride may be only two-byte aligned.
     query_storage = torch.empty(
@@ -202,8 +212,24 @@ def test_pa_decode_merge_alignment(
     )
     query_view.copy_(query)
     query = query_view
-    output_storage = torch.full_like(query_storage, float("nan"))
-    output = output_storage[1:].as_strided(query.shape, query.stride())
+    if output_layout != "same":
+        # Row and head strides differ from Q and keep only element alignment.
+        if output_layout == "heads_first":
+            output_strides = (dim + 3, query.shape[0] * (dim + 3) + 1, 1)
+            storage_size = group * output_strides[1] + 1
+        else:
+            output_strides = (group * (dim + 3) + 1, dim + 3, 1)
+            storage_size = query.shape[0] * output_strides[0] + 1
+        output_storage = torch.full(
+            (storage_size,),
+            float("nan"),
+            dtype=dtype,
+            device=device,
+        )
+    else:
+        output_strides = query.stride()
+        output_storage = torch.full_like(query_storage, float("nan"))
+    output = output_storage[1:].as_strided(query.shape, output_strides)
     key_cache = (
         key.to(torch.bfloat16)
         .reshape(-1, 1, page, dim // 8, 8)
@@ -217,17 +243,22 @@ def test_pa_decode_merge_alignment(
         .contiguous()
     )
     plan = pa.plan_pa_decode(
-        context, 1, max_partitions=4, workgroup_budget=None if mode == "cluster" else 1
+        context,
+        1,
+        max_partitions=1 if mode == "single" else 4,
+        workgroup_budget=None if mode == "cluster" else 1,
+        query_length=query_length,
     )
-    sinks = (
-        torch.full((group,), float("-inf"), dtype=dtype, device=device)
-        if mode == "reducer"
-        else None
-    )
-    scalar_shape = (1, plan.capacity, group)
+    sinks = None
+    if mode == "reducer":
+        sinks = torch.linspace(-3, 3, group, dtype=dtype, device=device)
+        sinks[0], sinks[-1] = float("-inf"), float("inf")
+    scalar_shape = (1, plan.capacity, query_length * group)
     partial_shape = (*scalar_shape, dim)
     partials = torch.empty(
-        plan.capacity * group * dim + scratch_offset, dtype=dtype, device=device
+        plan.capacity * query_length * group * dim + scratch_offset,
+        dtype=dtype,
+        device=device,
     )[scratch_offset:].reshape(partial_shape)
     workspace = {
         "exp_sums": torch.empty(scalar_shape, device=device),
@@ -248,14 +279,12 @@ def test_pa_decode_merge_alignment(
         value.to(torch.bfloat16).float(),
         table,
         context,
-        1,
+        query_length,
         0,
         sinks,
     )
-    for _ in range(3):
-        output.fill_(float("nan"))
-        for tensor in workspace.values():
-            tensor.fill_(float("nan"))
+
+    def launch():
         pa.pa_decode(
             output,
             query,
@@ -264,18 +293,71 @@ def test_pa_decode_merge_alignment(
             context,
             table,
             dim**-0.5,
-            1,
+            query_length,
             sinks=sinks,
             work_plan=plan,
+            max_context_length=1024,
             **workspace,
         )
-        _check_output(output, reference)
+
+    def check(reference):
+        assert torch.isfinite(output).all()
+        assert (
+            checkAllclose(
+                reference.float(),
+                output.float(),
+                atol=5e-3,
+                rtol=5e-3,
+                tol_err_ratio=0,
+                msg="pa_decode merge alignment",
+            )
+            == 0
+        )
         assert torch.count_nonzero(plan.arrival_counters) == 0
+
+    for _ in range(3):
+        output.fill_(float("nan"))
+        for tensor in workspace.values():
+            tensor.fill_(float("nan"))
+        launch()
+        check(reference)
     last_arriver = mode == "last" and scratch_offset == 0
-    assert compile_kwargs[-1]["direct_output"] == last_arriver
+    assert compile_kwargs[-1]["direct_output"] == (last_arriver or mode == "single")
     assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver or mode == "reducer" else 4
+        0 if last_arriver or mode in ("single", "reducer") else 4
     )
+    assert compile_kwargs[-1]["output_strides_match"] == (output_layout == "same")
+
+    # Replays and in-place plan refresh must also use the independent output
+    # strides when task counts change from multi-partition to single and empty.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        launch()
+    for length in (257, 0):
+        context[0] = length
+        pa.plan_pa_decode(context, 1, plan=plan, query_length=query_length)
+        query.neg_()
+        output.fill_(float("nan"))
+        for tensor in workspace.values():
+            tensor.fill_(float("nan"))
+        graph.replay()
+        check(
+            _reference(
+                query,
+                key.to(torch.bfloat16).float(),
+                value.to(torch.bfloat16).float(),
+                table,
+                context,
+                query_length,
+                0,
+                sinks,
+            )
+        )
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
@@ -871,6 +953,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
+        schedule_kwargs.pop("output_strides_match", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
