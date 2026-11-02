@@ -15,7 +15,11 @@ floor.
 The divisor cases run at TP 8: with the E5M2 group scale an outlier fill
 no longer clips at divisor 1, so divisor 1 must reach the SQNR floor and the
 opt-in divisor 8 must not lose more than 1 dB against it; a small-magnitude
-fill must keep full SQNR at the default divisor.
+fill must keep full SQNR at the default divisor. An above-fp16 fill (partials
+around 132k, reduced sums around 264k-334k, both signs, one large value per
+group next to small ones) must stay finite at divisor 1, where it clips at
+the fp16 range, and must reach the SQNR floor at divisor 8, which extends
+the range to 65504 * 8. Every case also requires finite output.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
@@ -77,6 +81,7 @@ _FILLS = (
     "overflow_512",
     "zeros",
     "large_every_rank",
+    "above_fp16",
 )
 _CODEC_FILL_CASES = (
     ("pos_underflow", "pos-underflow-2^-8"),
@@ -89,6 +94,14 @@ _CODEC_FILL_CASES = (
 _DIVISOR_SHAPES = [(512, 5120), (32768, 5120)]
 # Recommended opt-in divisor for inputs that clip at divisor 1.
 _OUTLIER_DIVISOR = 8.0
+# above_fp16: every 64th column is large, alternating sign by 64-column
+# block. Ranks 0 and 1 send 132k and the others 11.7k, so the reduced sum is
+# above the fp16 max at every TP size (~264k at TP 2, ~334k at TP 8) and
+# below 65504 * _OUTLIER_DIVISOR.
+_ABOVE_FP16_PERIOD = 64
+_ABOVE_FP16_COL = 5
+_ABOVE_FP16_LEAD = 132000.0
+_ABOVE_FP16_REST = 11700.0
 # One spawn per world size so compile happens once. hidden=4096 is a width
 # the ST pick was not fitted to; (8, 1024) is smaller than one 32 KiB tile.
 _VALIDITY_SHAPES = {
@@ -108,6 +121,15 @@ def _make_inp(
         return (torch.randn(shape, generator=gen, dtype=torch.float32) * std).to(
             device=device, dtype=torch.bfloat16
         )
+    if fill == "above_fp16":
+        gen = torch.Generator().manual_seed(1234 + rank)
+        x = torch.randn(shape, generator=gen, dtype=torch.float32)
+        cols = torch.arange(hidden)
+        big = cols % _ABOVE_FP16_PERIOD == _ABOVE_FP16_COL
+        sign = 1.0 - 2.0 * ((cols // _ABOVE_FP16_PERIOD) % 2).to(torch.float32)
+        mag = _ABOVE_FP16_LEAD if rank < 2 else _ABOVE_FP16_REST
+        x[:, big] = (sign * mag)[big]
+        return x.to(device=device, dtype=torch.bfloat16)
     if fill == "pos_underflow":
         val = 2.0**-8
     elif fill == "neg_underflow":
@@ -241,6 +263,7 @@ def _run_rank(
                 "sqnr_db": _sqnr_db(got, ref),
                 "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
                 "err": float(close_err),
+                "nonfinite": int((~torch.isfinite(got)).sum().item()),
                 "us": None,
             }
             if time_it:
@@ -327,6 +350,7 @@ def _assert_validity(
     world_size: int,
     label: str,
     check_close: bool = True,
+    check_sqnr: bool = True,
 ) -> dict:
     if len(ranks) != world_size:
         raise AssertionError(
@@ -339,6 +363,10 @@ def _assert_validity(
             continue
         for (tokens, hidden), row in zip(pairs, rows, strict=True):
             where = f"rank {rank} tokens={tokens} hidden={hidden}"
+            if row["nonfinite"]:
+                fails.append(f"{where}: {row['nonfinite']} non-finite outputs")
+            if not check_sqnr:
+                continue
             if row["sqnr_db"] < SQNR_MIN_DB:
                 fails.append(f"{where}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}")
             if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB:
@@ -353,6 +381,37 @@ def _assert_validity(
     if fails:
         raise AssertionError(f"{label} tp={world_size}: " + "; ".join(fails))
     return ranks[0][0]
+
+
+def _assert_above_fp16(
+    world_size: int, pairs: list[tuple[int, int]], *, grid_cap: int
+) -> None:
+    """Reduced sums above the fp16 max: finite at divisor 1, accurate at 8."""
+    for divisor in (1.0, _OUTLIER_DIVISOR):
+        ranks = _spawn(
+            world_size,
+            pairs,
+            time_it=False,
+            fill="above_fp16",
+            grid_cap=grid_cap,
+            divisor=divisor,
+        )
+        aiter.logger.info(
+            "above-fp16 tp=%s divisor=%s: SQNR %s dB",
+            world_size,
+            divisor,
+            [round(min(r[k]["sqnr_db"] for r in ranks), 2) for k in range(len(pairs))],
+        )
+        # Divisor 1 saturates at the fp16 max by design; only finiteness holds.
+        # CLOSE_ATOL is calibrated to the 0.1-std fill, not to these values.
+        _assert_validity(
+            ranks,
+            pairs=pairs,
+            world_size=world_size,
+            label=f"above-fp16 divisor={divisor}",
+            check_close=False,
+            check_sqnr=divisor != 1.0,
+        )
 
 
 @benchmark()
@@ -457,6 +516,7 @@ def main():
                 2, codec_pairs, time_it=False, fill=fill, grid_cap=args.grid_cap
             )
             _assert_validity(ranks, pairs=codec_pairs, world_size=2, label=label)
+        _assert_above_fp16(2, codec_pairs, grid_cap=args.grid_cap)
 
     for tp, pairs in _VALIDITY_SHAPES.items():
         if n_gpu < tp:
@@ -525,6 +585,7 @@ def main():
                     f"{_OUTLIER_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
                     "at divisor 1; the opt-in divisor should not cost precision"
                 )
+        _assert_above_fp16(TP, _DIVISOR_SHAPES, grid_cap=args.grid_cap)
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
