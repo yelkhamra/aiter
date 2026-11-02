@@ -59,10 +59,6 @@ _S1F_VARIANTS = {64: (3, 2), 128: (3, 2), 256: (3, 1)}
 _S1F_GROUP_M = 8
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
-# Decode steps have too little expert GEMM to hide the compact plan if the plan
-# waits out dispatch first. At or below this token count the next layer's plan
-# starts before dispatch returns and overlaps both.
-_DECODE_PLAN_OVERLAP_TOKENS = 128
 
 
 def read_s1f_mode() -> bool:
@@ -350,7 +346,6 @@ class _Stage1Fusion:
             _QUANT_FUSE_BLOCKS
             and run
             and self.wire is not None
-            and not d._plan_pending
             and self.plan_mode(d._step.align_m)
         )
 
