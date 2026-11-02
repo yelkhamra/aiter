@@ -249,12 +249,14 @@ def pa_decode(
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
-    sinks are absent, a cap of one writes output
-    directly. So do plans with one task slot per sequence (capacity equal to
-    the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
-    that still own several tasks merge them in the tile kernel using the plan's
-    arrival counters when partial scratch is eight-byte aligned. Otherwise,
-    when P = min(partition bound, max_partitions)
+    sinks are absent, a cap of one writes output directly using its own strides.
+    When query/output strides match, so do plans with one task slot per sequence
+    (capacity equal to the batch, at most 8 partitions per sequence, head_dim
+    <= 512): sequences that still own several tasks merge them in the tile
+    kernel using the plan's arrival counters when partial scratch is eight-byte
+    aligned. Independent output layouts retain the reducer for those otherwise
+    last-arriver-eligible plans. Other plans can use clusters when
+    P = min(partition bound, max_partitions)
     is in [2, 16], P CTAs per sequence fit the plan capacity or two per CU,
     and the sequences times KV heads stay within 15 per 16 CUs (head_dim <=
     512), each sequence's tasks run as one cluster of P workgroups that merges

@@ -661,7 +661,9 @@ def compile_gfx1250_pa_decode(
             # uniformity through the remap and its conditional task load, so
             # dependent page-table loads can use scalar memory in the mainloop.
             count = fx.Int32(
-                fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(info[task_slot * 2 + 1]))
+                fx.rocdl.readfirstlane(
+                    fx.Int32.ir_type, fx.Int32(info[task_slot * 2 + 1])
+                )
             )
             first = fx.Int32(
                 fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(info[task_slot * 2]))
@@ -676,7 +678,9 @@ def compile_gfx1250_pa_decode(
         if const_expr(t.direct_output):
             task = fx.Vector.from_elements(
                 [
-                    fx.Int32(fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(task[i])))
+                    fx.Int32(
+                        fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(task[i]))
+                    )
                     for i in range_constexpr(4)
                 ],
                 dtype=fx.Int32,
@@ -737,8 +741,9 @@ def compile_gfx1250_pa_decode(
                 Gfx1250WavePipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
-        if const_expr(t.direct_output):
-            # Clear empty sequences after the active path's input-table reads.
+        if const_expr(t.direct_output):  # noqa: SIM102
+            # Keep count inside its compile-time specialization and clear empty
+            # sequences after the active path's input-table reads.
             if count == 0:
                 zero_output(gpu.block_id("x"), pout)
         if const_expr(t.merge_partitions):
