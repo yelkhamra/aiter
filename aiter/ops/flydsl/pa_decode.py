@@ -650,25 +650,29 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
+    output_strides_match = output.stride() == query.stride()
+    last_arriver_eligible = (
+        arch == "gfx1250"
+        and sinks is None
+        and work_plan.capacity == num_seqs
+        and work_plan.arrival_counters is not None
+        and max_partitions <= MERGE_PARTITIONS
+        and head_dim <= MERGE_HEAD_DIM
+        # Last-arriver partials use naturally aligned 64-bit atomics.
+        # Internal torch allocations are aligned; supplied contiguous
+        # views may have only element alignment.
+        and (
+            pout is None
+            or (isinstance(pout, torch.Tensor) and pout.data_ptr() % 8 == 0)
+        )
+    )
+    # Independent layouts retain the reducer for last-arriver-eligible plans:
+    # those sparse batches regress when switching from their reducer fallback.
+    # Single-partition stores and wider cluster plans still use output strides.
     direct_output = (
         arch == "gfx1250"
         and sinks is None
-        and (
-            num_partitions == 1
-            or (
-                work_plan.capacity == num_seqs
-                and work_plan.arrival_counters is not None
-                and max_partitions <= MERGE_PARTITIONS
-                and head_dim <= MERGE_HEAD_DIM
-                # Last-arriver partials use naturally aligned 64-bit atomics.
-                # Internal torch allocations are aligned; supplied contiguous
-                # views may have only element alignment.
-                and (
-                    pout is None
-                    or (isinstance(pout, torch.Tensor) and pout.data_ptr() % 8 == 0)
-                )
-            )
-        )
+        and (num_partitions == 1 or (last_arriver_eligible and output_strides_match))
     )
     one_partition_output = direct_output and num_partitions == 1
     num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -682,6 +686,7 @@ def pa_decode(
         if (
             arch == "gfx1250"
             and not direct_output
+            and (output_strides_match or not last_arriver_eligible)
             and sinks is None
             and 2 <= max_partitions <= CLUSTER_PARTITIONS
             and num_seqs * max_partitions
@@ -725,7 +730,7 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
-            output_strides_match=output.stride() == query.stride(),
+            output_strides_match=output_strides_match,
         )
 
     total_rows = query_length * query_group_size

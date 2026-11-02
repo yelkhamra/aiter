@@ -197,6 +197,7 @@ def test_pa_decode_merge_alignment(
     Last-arriver atomics require eight-byte scratch alignment; unaligned
     scratch falls back to the cluster merge. Cluster loads and final stores
     support the otherwise valid offset views directly, as does the reducer.
+    Independent outputs retain the reducer for aligned last-arriver plans.
     Sinks still use that fallback, including +/-inf and finite values.
     """
     if get_gfx_runtime() != "gfx1250":
@@ -325,10 +326,11 @@ def test_pa_decode_merge_alignment(
             tensor.fill_(float("nan"))
         launch()
         check(reference)
-    last_arriver = mode == "last" and scratch_offset == 0
+    last_arriver_eligible = mode == "last" and scratch_offset == 0
+    last_arriver = last_arriver_eligible and output_layout == "same"
     assert compile_kwargs[-1]["direct_output"] == (last_arriver or mode == "single")
     assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver or mode in ("single", "reducer") else 4
+        0 if last_arriver_eligible or mode in ("single", "reducer") else 4
     )
     assert compile_kwargs[-1]["output_strides_match"] == (output_layout == "same")
 
