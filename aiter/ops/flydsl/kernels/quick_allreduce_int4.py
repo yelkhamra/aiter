@@ -10,10 +10,11 @@ Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``atoms / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
 stays ``atoms * 1152``.
 
-``divisor`` defaults to ``DEFAULT_DIVISOR``. Loaded fp16 is divided by it
-before the first pack; the gathered sum is multiplied by it once, through
-the all-gather dequant scale, before the bf16 store. The second pack is
-left unchanged.
+``divisor`` defaults to ``DEFAULT_DIVISOR``. Loaded bf16 is divided by it in
+fp32, before the narrowing to fp16, and the gathered sum is multiplied by it
+in fp32 before the bf16 store (or the fused residual add), so values up to
+``65504 * divisor`` survive the fp16 codec math. The second pack is left
+unchanged.
 """
 
 import flydsl.compiler as flyc
@@ -135,12 +136,15 @@ def _pair_signed_ext_f16(atom):
     return fx.Float32((abs(lo) > abs(hi)).select(lo, hi))
 
 
-def _atom_bf16_to_f16(atom):
-    return fx.Vector(atom).bitcast(fx.BFloat16).to(fx.Float16).bitcast(fx.Int32)
+def _atom_bf16_to_f16_scaled(atom, scale):
+    """bf16 -> f32, times *scale* (f32x8), then narrow to fp16."""
+    x = fx.Vector(atom).bitcast(fx.BFloat16).to(fx.Float32) * scale
+    return x.to(fx.Float16).bitcast(fx.Int32)
 
 
-def _atom_f16_to_bf16(atom):
-    return fx.Vector(atom).bitcast(fx.Float16).to(fx.BFloat16).bitcast(fx.Int32)
+def _atom_f16_to_f32_scaled(atom, scale):
+    """fp16 -> f32, times *scale* (f32x8)."""
+    return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32) * scale
 
 
 def _f32_to_e4m3(x):
@@ -642,35 +646,37 @@ def make_quick_allreduce_int4_kernel(
             off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
             buffer_ops.buffer_store(color, color_rsrc, off)
 
+        # One shared divisor, applied on the fp32 side of the fp16 codec math:
+        # inputs are divided before the narrowing to fp16 and the sum is
+        # restored before the bf16 store, so values up to 65504 * divisor
+        # survive. A packed divide expands per element, so multiply by a
+        # reciprocal taken once.
+        inv_div_f32 = fx.full(8, fx.Float32(1.0) / divisor, fx.Float32)
+        div_f32 = fx.full(8, divisor, fx.Float32)
+
         def _load_tile_atoms(tile):
+            """Load one tile as fp16 atoms already divided by the divisor.
+
+            The group max and scale byte then see the scaled values;
+            ``_codec_quant`` is shared by both packs, so it must not scale.
+            """
             atoms = []
             for atom in range_constexpr(ATOMS):
                 src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
                 frag = fx.make_fragment_like(src)
                 fx.copy(hbm_copy_atom, src, frag)
-                atoms.append(_atom_bf16_to_f16(fx.Vector(frag.load())))
+                atoms.append(
+                    _atom_bf16_to_f16_scaled(fx.Vector(frag.load()), inv_div_f32)
+                )
             return atoms
-
-        # One shared divisor. Scale before the first pack so the group max and
-        # E4M3 byte see the scaled values; _codec_quant is used by both packs,
-        # so it must not scale. A packed fp16 divide expands per element, so
-        # multiply by a reciprocal taken once.
-        inv_div_h = _splat_f16x2((fx.Float32(1.0) / divisor).to(fx.Float16))
-        div_h = _splat_f16x2(divisor.to(fx.Float16))
-
-        def _div_fp16_atoms(atoms):
-            scaled = []
-            for i in range_constexpr(ATOMS):
-                atom = atoms[i]
-                parts = []
-                for j in range_constexpr(4):
-                    parts.append(_i32(_f16x2(atom[j]) * inv_div_h))
-                scaled.append(fx.Vector.from_elements(parts, fx.Int32))
-            return scaled
 
         def _store_tile_atoms(tile, atoms):
             for atom in range_constexpr(ATOMS):
-                packed = _atom_f16_to_bf16(atoms[atom])
+                packed = (
+                    _atom_f16_to_f32_scaled(atoms[atom], div_f32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)
+                )
                 dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
                 frag = fx.make_fragment_like(dst)
                 frag.store(packed)
@@ -810,11 +816,8 @@ def make_quick_allreduce_int4_kernel(
                 for i in range_constexpr(NORM_GROUP):
                     atom = g + i
                     packed, scale = pkts[i]
-                    ar = (
-                        fx.Vector(_codec_dequant(packed, scale * div_h))
-                        .bitcast(fx.Float16)
-                        .to(fx.Float32)
-                    )
+                    # Restore the divisor in fp32, before the residual add.
+                    ar = _atom_f16_to_f32_scaled(_codec_dequant(packed, scale), div_f32)
                     x = ar + ress[i].bitcast(fx.BFloat16).to(fx.Float32)
                     xb = x.to(fx.BFloat16).bitcast(fx.Int32)
                     _store_atom_bf16(res_out_rsrc, _atom_soff(tile, atom), xb)
@@ -1035,8 +1038,8 @@ def make_quick_allreduce_int4_kernel(
         def _recv_all_gather(sub):
             """Dequantize every peer's all-gather packet back into full-tile atoms.
 
-            The divisor multiply is folded into each packet's group scale:
-            one packed multiply per packet instead of one per fp16 pair.
+            Atoms stay in fp16 at the divisor-scaled magnitude;
+            ``_store_tile_atoms`` restores the divisor in fp32.
             """
             gathered = []
             for src in range_constexpr(world_size):
@@ -1044,7 +1047,7 @@ def make_quick_allreduce_int4_kernel(
                     packed, scale = _recv_quantized(
                         PHASE_ALL_GATHER, fx.Int32(src), sub, k
                     )
-                    gathered.append(_codec_dequant(packed, scale * div_h))
+                    gathered.append(_codec_dequant(packed, scale))
             return gathered
 
         n_block_tiles = (num_tiles - bid + fx.Int32(grid - 1)) // fx.Int32(grid)
@@ -1055,7 +1058,7 @@ def make_quick_allreduce_int4_kernel(
                 res_pref = None
                 if const_expr(NORM_LATENCY):
                     res_pref = _prefetch_residual(tile)
-                atoms = _div_fp16_atoms(_load_tile_atoms(tile))
+                atoms = _load_tile_atoms(tile)
                 _pack_reduce_scatter(atoms)
                 gpu.barrier()
                 _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
@@ -1083,7 +1086,7 @@ def make_quick_allreduce_int4_kernel(
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * fx.Int32(grid)
-                    atoms = _div_fp16_atoms(_load_tile_atoms(tile))
+                    atoms = _load_tile_atoms(tile)
                     _pack_reduce_scatter(atoms)
                     gpu.barrier()
                     _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)

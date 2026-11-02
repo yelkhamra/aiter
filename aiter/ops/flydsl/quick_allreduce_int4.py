@@ -36,11 +36,12 @@ from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
-# The sum is restored in fp16 before the bf16 store, by scaling each group's
-# dequant scale by the divisor. The bounds were derived for the E4M3 group
-# scale (dequant step >= 2**-10, max 480). The group scale is now E5M2 (bias
-# 12, [2**-12, 1.75 * 2**19]), which covers every fp16 extremum at divisor 1,
-# so the divisor is only an opt-in and the original bounds are kept.
+# The E5M2 group scale (bias 12, [2**-12, 1.75 * 2**19]) covers every fp16
+# extremum at divisor 1. The kernel divides by the divisor in fp32 before
+# narrowing to fp16 and restores the sum in fp32 before the bf16 store, so
+# the opt-in divisor extends the range to 65504 * divisor. The bounds only
+# limit the precision trade-off: a large divisor pushes small inputs toward
+# the bottom of the fp16 range.
 DIVISOR_MIN = 2.0**-4
 DIVISOR_MAX = 128.0
 
@@ -548,8 +549,9 @@ class QuickAllReduceInt4:
 
         ``stream=None`` uses the current PyTorch stream on this device.
         ``divisor`` defaults to 1, which keeps the previous INT4 result.
-        Loaded values are divided by it before the first pack, and the
-        finished sum is multiplied by it once. Every rank must pass the same
+        Loaded values are divided by it in fp32 before the fp16 codec math,
+        and the finished sum is multiplied by it once in fp32, so values up
+        to ``65504 * divisor`` survive. Every rank must pass the same
         divisor; this is not checked, and a mismatch silently gives each rank
         a different result.
         """
