@@ -330,14 +330,15 @@ def parse_csv(csv_path: str):
     batched_skipped = set()
     # The mxfp8 table's gfx950 rows, and the e8m0 blockscale table's kernelId
     # "mxfp8" rows, name mxpsh / 8-wave kernels that read the raw (unshuffled)
-    # scales of the row's w_scale_block. No runtime path reads the shuffled-scale
-    # mxpsh rows any other table may still hold.
+    # scales of the row's w_scale_block. Dense a4w4 mxpsh rows instead read
+    # shuffled per-1x32 scales.
     mxfp8_table = "a8w8_mxfp8_bpreshuffle" in os.path.basename(csv_path)
 
     for row in other_rows:
         kernel_name = row.get("kernelName", "").strip()
         libtype = row.get("libtype", "").strip()
-        if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
+        mxfp4 = kernel_name.startswith("flydsl_mxpsh_") and "_F4_F4_" in kernel_name
+        if (libtype != "flydsl" and not mxfp4) or not kernel_name.startswith("flydsl_"):
             continue
 
         if row.get("b", "").strip():  # a batched row (may be in a mixed table)
@@ -392,13 +393,22 @@ def parse_csv(csv_path: str):
         if kernel_name.startswith("flydsl_bpreshuflle_"):
             params = _parse_preshuffle_kernel_name(kernel_name)
         elif kernel_name.startswith("flydsl_mxpsh_"):
-            if not raw_scales:
-                continue  # a shuffled-scale row: nothing reads it
+            if not raw_scales and not mxfp4:
+                continue  # Other shuffled-scale rows have no matching runtime path.
             params = parse_mxscale_preshuffle_kernel_name(kernel_name)
             if params is not None:
                 params = dict(params)
                 params["kind"] = "mxscale_preshuffle"
-                params.update(dict(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK[mxfp8_block]))
+                params.update(
+                    {
+                        "a_scale_block": "1x32",
+                        "b_scale_block": "1x32",
+                        "a_scale_layout": "mfma_tile",
+                        "b_scale_layout": "mfma_tile",
+                    }
+                    if mxfp4
+                    else dict(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK[mxfp8_block])
+                )
         elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
             params = parse_8wave_kernel_name(kernel_name)
             if params is not None:
@@ -852,6 +862,7 @@ def _compile_mxscale_preshuffle_to_cache(
     K1 = (k + 255) // 256
     # Dummy scale buffers of each operand's (block, layout) size.
     shapes = {
+        ("1x32", "mfma_tile"): None,
         ("1x128", "mfma_tile"): (rows * 2 * K1,),
         ("128x128", "mfma_tile"): ((n // 128) * 4 * K1,),
         ("1x32", "row"): None,  # per operand below: (rows, K // 32)
@@ -866,11 +877,13 @@ def _compile_mxscale_preshuffle_to_cache(
     ):
         if (block, layout) not in shapes:
             raise NotImplementedError(
-                f"mxscale preshuffle AOT covers the a8w8 blockscale and 1x32 row "
-                f"scales; got {block} {layout}. A 1x32 mfma_tile scale (a4w4 / "
-                f"a6w4) needs matching tuner and runner support first."
+                f"Unsupported mxscale AOT scales: {block} {layout}"
             )
-        shape = shapes[(block, layout)] or (nrows, k // 32)
+        shape = (
+            ((nrows + 255) // 256 * 256, k // 32)
+            if (block, layout) == ("1x32", "mfma_tile")
+            else shapes[(block, layout)] or (nrows, k // 32)
+        )
         scales.append(torch.empty(shape, device=dev, dtype=torch.uint8))
     a_scale, b_scale = scales
 
