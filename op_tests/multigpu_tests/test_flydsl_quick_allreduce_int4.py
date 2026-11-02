@@ -21,6 +21,12 @@ group next to small ones) must stay finite at divisor 1, where it clips at
 the fp16 range, and must reach the SQNR floor at divisor 8, which extends
 the range to 65504 * 8. Every case also requires finite output.
 
+The scale format is chosen per 512-value wave slice: E4M3 where every group
+fits it, else E5M2. Data that fits E4M3 must keep E4M3 precision: the
+N(0, 0.1) validity shapes and the in-range rows of two mixed fills (in-range
+channel outliers; a few massive tokens among quiet rows) must reach
+``IN_RANGE_SQNR_MIN_DB``, which an E5M2-only scale misses.
+
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
 archs skip, and ``main()`` skips a world size when fewer GPUs are visible
@@ -64,6 +70,9 @@ except (KeyError, RuntimeError):
     ARCH = None
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SQNR_MIN_DB = 18.0
+# Data whose groups fit the E4M3 scale keeps E4M3 precision: about 19.2 dB
+# on these fills, where an E5M2 scale gives 18.4 to 18.9.
+IN_RANGE_SQNR_MIN_DB = 19.0
 # A 32 KiB tile the kernel never wrote scores ~0 dB; codec noise stays above 8.
 TILE_SQNR_MIN_DB = 8.0
 # Calibrated to the INT4 group-16 codec vs fp32 all-reduce, not bit identity.
@@ -76,12 +85,15 @@ _FILLS = (
     "normal",
     "outlier",
     "small",
+    "tiny",
     "pos_underflow",
     "neg_underflow",
     "overflow_512",
     "zeros",
     "large_every_rank",
     "above_fp16",
+    "channel_outliers",
+    "massive_tokens",
 )
 _CODEC_FILL_CASES = (
     ("pos_underflow", "pos-underflow-2^-8"),
@@ -89,6 +101,9 @@ _CODEC_FILL_CASES = (
     ("overflow_512", "overflow-512"),
     ("zeros", "true-zero-scale"),
     ("large_every_rank", "every-rank-2048"),
+    # Every group extremum between E5M2's 2**-12 and E4M3's 2**-7 minimum
+    # scale: needs the E5M2 fallback for small slices.
+    ("tiny", "tiny-std-1e-3"),
 )
 # (512, 5120) runs ST=1 and (32768, 5120) runs ST=8.
 _DIVISOR_SHAPES = [(512, 5120), (32768, 5120)]
@@ -102,6 +117,13 @@ _ABOVE_FP16_PERIOD = 64
 _ABOVE_FP16_COL = 5
 _ABOVE_FP16_LEAD = 132000.0
 _ABOVE_FP16_REST = 11700.0
+# Mixed-format fills, checked for in-range precision where they fit E4M3.
+# channel_outliers: per-channel lognormal scale shared by every rank, sized
+# so the reduced maximum stays near 400. massive_tokens: N(0, 1) with 2% of
+# rows carrying 3k to 20k on 4 channels, so one call mixes E4M3 slices
+# (quiet rows) and E5M2 slices (loud rows).
+_MIXED_FILLS = ("channel_outliers", "massive_tokens")
+_LOUD = 1000.0
 # One spawn per world size so compile happens once. hidden=4096 is a width
 # the ST pick was not fitted to; (8, 1024) is smaller than one 32 KiB tile.
 _VALIDITY_SHAPES = {
@@ -112,12 +134,35 @@ _VALIDITY_SHAPES = {
 
 
 def _make_inp(
-    tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
+    tokens: int,
+    hidden: int,
+    fill: str,
+    *,
+    rank: int,
+    device: torch.device,
+    world_size: int = WORLD,
 ) -> torch.Tensor:
     shape = (tokens, hidden)
-    if fill in ("normal", "outlier", "small"):
+    if fill == "channel_outliers":
+        shared = torch.Generator().manual_seed(77)
+        ch = torch.exp(torch.randn(hidden, generator=shared) * 1.5)
+        ch = ch * (400.0 / (float(ch.max()) * 5.0 * world_size**0.5))
         gen = torch.Generator().manual_seed(1234 + rank)
-        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005}[fill]
+        x = torch.randn(shape, generator=gen, dtype=torch.float32) * ch
+        return x.to(device=device, dtype=torch.bfloat16)
+    if fill == "massive_tokens":
+        gen = torch.Generator().manual_seed(1234 + rank)
+        x = torch.randn(shape, generator=gen, dtype=torch.float32)
+        shared = torch.Generator().manual_seed(78)
+        rows = torch.randperm(tokens, generator=shared)[: max(1, tokens // 50)]
+        cols = torch.randperm(hidden, generator=shared)[:4]
+        mag = torch.empty(len(rows), 4).uniform_(3e3, 2e4, generator=shared)
+        sign = torch.where(torch.rand(len(rows), 4, generator=shared) < 0.5, -1.0, 1.0)
+        x[rows[:, None], cols[None, :]] = sign * mag / world_size
+        return x.to(device=device, dtype=torch.bfloat16)
+    if fill in ("normal", "outlier", "small", "tiny"):
+        gen = torch.Generator().manual_seed(1234 + rank)
+        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005, "tiny": 1e-3}[fill]
         return (torch.randn(shape, generator=gen, dtype=torch.float32) * std).to(
             device=device, dtype=torch.bfloat16
         )
@@ -162,6 +207,14 @@ def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
     return float(
         _sqnr((reference * reference).mean(), ((got - reference) ** 2).mean()).item()
     )
+
+
+def _quiet_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
+    """SQNR over rows whose reduced magnitude stays below ``_LOUD``."""
+    quiet = reference.abs().amax(dim=-1) < _LOUD
+    if not bool(quiet.any()):
+        return float("inf")
+    return _sqnr_db(got[quiet], reference[quiet])
 
 
 def _min_tile_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
@@ -237,7 +290,7 @@ def _run_rank(
     rows = []
     try:
         for ntok, hidden in zip(tokens, hiddens, strict=True):
-            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
+            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device, world_size=tp)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
             dist.barrier()
@@ -264,6 +317,7 @@ def _run_rank(
                 "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
                 "err": float(close_err),
                 "nonfinite": int((~torch.isfinite(got)).sum().item()),
+                "quiet_sqnr_db": _quiet_sqnr_db(got, ref),
                 "us": None,
             }
             if time_it:
@@ -351,6 +405,7 @@ def _assert_validity(
     label: str,
     check_close: bool = True,
     check_sqnr: bool = True,
+    sqnr_min: float = SQNR_MIN_DB,
 ) -> dict:
     if len(ranks) != world_size:
         raise AssertionError(
@@ -367,8 +422,8 @@ def _assert_validity(
                 fails.append(f"{where}: {row['nonfinite']} non-finite outputs")
             if not check_sqnr:
                 continue
-            if row["sqnr_db"] < SQNR_MIN_DB:
-                fails.append(f"{where}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}")
+            if row["sqnr_db"] < sqnr_min:
+                fails.append(f"{where}: SQNR {row['sqnr_db']:.2f} dB < {sqnr_min}")
             if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB:
                 fails.append(
                     f"{where}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB "
@@ -412,6 +467,45 @@ def _assert_above_fp16(
             check_close=False,
             check_sqnr=divisor != 1.0,
         )
+
+
+def _assert_in_range_precision(
+    world_size: int, pairs: list[tuple[int, int]], *, grid_cap: int
+) -> None:
+    """Rows that fit the E4M3 group scale keep E4M3 precision.
+
+    The scale format is chosen per 512-value wave slice, so quiet rows next
+    to loud ones (and in-range channel outliers) must not fall back to the
+    coarser E5M2 mantissa.
+    """
+    for fill in _MIXED_FILLS:
+        ranks = _spawn(world_size, pairs, time_it=False, fill=fill, grid_cap=grid_cap)
+        _assert_validity(
+            ranks,
+            pairs=pairs,
+            world_size=world_size,
+            label=fill,
+            check_close=False,
+        )
+        fails = []
+        for rank, rows in enumerate(ranks):
+            for (tokens, hidden), row in zip(pairs, rows, strict=True):
+                if row["quiet_sqnr_db"] < IN_RANGE_SQNR_MIN_DB:
+                    fails.append(
+                        f"rank {rank} tokens={tokens} hidden={hidden}: in-range "
+                        f"SQNR {row['quiet_sqnr_db']:.2f} dB < {IN_RANGE_SQNR_MIN_DB}"
+                    )
+        aiter.logger.info(
+            "%s tp=%s: in-range SQNR %s dB",
+            fill,
+            world_size,
+            [
+                round(min(r[k]["quiet_sqnr_db"] for r in ranks), 2)
+                for k in range(len(pairs))
+            ],
+        )
+        if fails:
+            raise AssertionError(f"{fill} tp={world_size}: " + "; ".join(fails))
 
 
 @benchmark()
@@ -517,6 +611,7 @@ def main():
             )
             _assert_validity(ranks, pairs=codec_pairs, world_size=2, label=label)
         _assert_above_fp16(2, codec_pairs, grid_cap=args.grid_cap)
+        _assert_in_range_precision(2, [(512, 5120)], grid_cap=args.grid_cap)
 
     for tp, pairs in _VALIDITY_SHAPES.items():
         if n_gpu < tp:
@@ -528,7 +623,14 @@ def main():
             )
             continue
         ranks = _spawn(tp, pairs, time_it=False, grid_cap=args.grid_cap)
-        _assert_validity(ranks, pairs=pairs, world_size=tp, label="validity")
+        # N(0, 0.1) fits the E4M3 group scale everywhere.
+        _assert_validity(
+            ranks,
+            pairs=pairs,
+            world_size=tp,
+            label="validity",
+            sqnr_min=IN_RANGE_SQNR_MIN_DB,
+        )
 
     if n_gpu < TP:
         aiter.logger.warning(
@@ -586,6 +688,7 @@ def main():
                     "at divisor 1; the opt-in divisor should not cost precision"
                 )
         _assert_above_fp16(TP, _DIVISOR_SHAPES, grid_cap=args.grid_cap)
+        _assert_in_range_precision(TP, _DIVISOR_SHAPES, grid_cap=args.grid_cap)
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
