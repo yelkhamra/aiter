@@ -985,6 +985,7 @@ def _compile_blockscale_8wave_to_cache(
     n: int,
     k: int,
     target_gfx: str,
+    num_xcds: int,
     **kwargs,
 ):
     del kwargs
@@ -1012,7 +1013,7 @@ def _compile_blockscale_8wave_to_cache(
     # A tuned row has no output-dtype key, so precompile both public outputs.
     for out_dtype in (torch.bfloat16, torch.float16):
         out = torch.empty((m, n), device=dev, dtype=out_dtype)
-        exe = _compile_gemm(n, k, kernel_name, -1, out_dtype)
+        exe = _compile_gemm(n, k, kernel_name, -1, out_dtype, num_xcds)
         _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, fx.Stream(0))
 
 
@@ -1318,6 +1319,7 @@ def compile_one_config(
                     n=n,
                     k=k,
                     target_gfx=aot_arch,
+                    num_xcds=num_xcds,
                     **kwargs,
                 )
             elif kind == "mxfp8_8wave":
