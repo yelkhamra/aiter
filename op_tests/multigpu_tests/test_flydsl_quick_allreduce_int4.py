@@ -15,16 +15,18 @@ floor.
 The divisor cases run at TP 8: with the E5M2 group scale an outlier fill
 no longer clips at divisor 1, so divisor 1 must reach the SQNR floor and the
 opt-in divisor 8 must not lose more than 1 dB against it; a small-magnitude
-fill must keep full SQNR at the default divisor. An above-fp16 fill (partials
-around 132k, reduced sums around 264k-334k, both signs, one large value per
-group next to small ones) must stay finite at divisor 1, where it clips at
-the fp16 range, and must reach the SQNR floor at divisor 8, which extends
-the range to 65504 * 8. Every case also requires finite output.
+fill must keep full SQNR at the default divisor. The same spawns run an
+above-fp16 fill (partials around 132k, reduced sums around 334k, both signs,
+one large value per group next to small ones): it must stay finite at
+divisor 1, where it clips at the fp16 range, and must reach the SQNR floor
+at divisor 8, which extends the range to 65504 * 8. Every case also requires
+finite output.
 
 The scale format is chosen per 512-value wave slice: E4M3 where every group
-fits it, else E5M2. Data that fits E4M3 must keep E4M3 precision: the
-N(0, 0.1) validity shapes and the in-range rows of two mixed fills (in-range
-channel outliers; a few massive tokens among quiet rows) must reach
+fits it, else E5M2. Data that fits E4M3 must keep E4M3 precision. At every
+TP size the validity spawn runs N(0, 0.1) and two mixed fills (in-range
+channel outliers; a few massive tokens among quiet rows) on ST=1 and ST=8
+shapes; N(0, 0.1) and the in-range rows of the mixed fills must reach
 ``IN_RANGE_SQNR_MIN_DB``, which an E5M2-only scale misses.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
@@ -244,7 +246,7 @@ def _run_rank(
     hiddens: list[int],
     super_tile: int,
     grid_cap: int,
-    fill: str,
+    fills: tuple[str, ...],
     time_it: bool,
     divisor: float = DEFAULT_DIVISOR,
 ) -> list[dict]:
@@ -289,7 +291,9 @@ def _run_rank(
 
     rows = []
     try:
-        for ntok, hidden in zip(tokens, hiddens, strict=True):
+        for fill, (ntok, hidden) in itertools.product(
+            fills, zip(tokens, hiddens, strict=True)
+        ):
             inp = _make_inp(ntok, hidden, fill, rank=rank, device=device, world_size=tp)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
@@ -310,6 +314,7 @@ def _run_rank(
                 msg=f"quick_allreduce_int4 rank {rank}",
             )
             row = {
+                "fill": fill,
                 "tokens": ntok,
                 "hidden": hidden,
                 "grid_cap": grid_cap,
@@ -350,9 +355,13 @@ def _spawn(
     time_it: bool,
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
-    fill: str = "normal",
+    fill: str | tuple[str, ...] = "normal",
     divisor: float = DEFAULT_DIVISOR,
 ) -> list[list[dict]]:
+    """Run every fill on every pair in one engine per rank (one compile).
+
+    Rows are fill-major; select one fill's rows with ``_rows_for``.
+    """
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
@@ -375,7 +384,7 @@ def _spawn(
                     "hiddens": hidden_list,
                     "super_tile": super_tile,
                     "grid_cap": grid_cap,
-                    "fill": fill,
+                    "fills": (fill,) if isinstance(fill, str) else tuple(fill),
                     "time_it": time_it,
                     "divisor": divisor,
                 },
@@ -395,6 +404,10 @@ def _spawn(
             f"QuickAllReduceInt4 gathered {len(ranks)} ranks, expected {world_size}"
         )
     return ranks
+
+
+def _rows_for(ranks: list[list[dict]], fill: str) -> list[list[dict]]:
+    return [[row for row in rows if row["fill"] == fill] for rows in ranks]
 
 
 def _assert_validity(
@@ -439,18 +452,13 @@ def _assert_validity(
 
 
 def _assert_above_fp16(
-    world_size: int, pairs: list[tuple[int, int]], *, grid_cap: int
+    by_divisor: dict[float, list[list[dict]]],
+    *,
+    pairs: list[tuple[int, int]],
+    world_size: int,
 ) -> None:
     """Reduced sums above the fp16 max: finite at divisor 1, accurate at 8."""
-    for divisor in (1.0, _OUTLIER_DIVISOR):
-        ranks = _spawn(
-            world_size,
-            pairs,
-            time_it=False,
-            fill="above_fp16",
-            grid_cap=grid_cap,
-            divisor=divisor,
-        )
+    for divisor, ranks in by_divisor.items():
         aiter.logger.info(
             "above-fp16 tp=%s divisor=%s: SQNR %s dB",
             world_size,
@@ -470,25 +478,26 @@ def _assert_above_fp16(
 
 
 def _assert_in_range_precision(
-    world_size: int, pairs: list[tuple[int, int]], *, grid_cap: int
+    ranks: list[list[dict]], *, pairs: list[tuple[int, int]], world_size: int
 ) -> None:
     """Rows that fit the E4M3 group scale keep E4M3 precision.
 
     The scale format is chosen per 512-value wave slice, so quiet rows next
     to loud ones (and in-range channel outliers) must not fall back to the
-    coarser E5M2 mantissa.
+    coarser E5M2 mantissa. The validity shapes run ST=1 and ST=8 at every TP
+    size, so every layout of the per-slice format bits sees mixed formats.
     """
     for fill in _MIXED_FILLS:
-        ranks = _spawn(world_size, pairs, time_it=False, fill=fill, grid_cap=grid_cap)
+        rows_by_rank = _rows_for(ranks, fill)
         _assert_validity(
-            ranks,
+            rows_by_rank,
             pairs=pairs,
             world_size=world_size,
             label=fill,
             check_close=False,
         )
         fails = []
-        for rank, rows in enumerate(ranks):
+        for rank, rows in enumerate(rows_by_rank):
             for (tokens, hidden), row in zip(pairs, rows, strict=True):
                 if row["quiet_sqnr_db"] < IN_RANGE_SQNR_MIN_DB:
                     fails.append(
@@ -500,7 +509,7 @@ def _assert_in_range_precision(
             fill,
             world_size,
             [
-                round(min(r[k]["quiet_sqnr_db"] for r in ranks), 2)
+                round(min(r[k]["quiet_sqnr_db"] for r in rows_by_rank), 2)
                 for k in range(len(pairs))
             ],
         )
@@ -610,8 +619,6 @@ def main():
                 2, codec_pairs, time_it=False, fill=fill, grid_cap=args.grid_cap
             )
             _assert_validity(ranks, pairs=codec_pairs, world_size=2, label=label)
-        _assert_above_fp16(2, codec_pairs, grid_cap=args.grid_cap)
-        _assert_in_range_precision(2, [(512, 5120)], grid_cap=args.grid_cap)
 
     for tp, pairs in _VALIDITY_SHAPES.items():
         if n_gpu < tp:
@@ -622,15 +629,22 @@ def main():
                 tp,
             )
             continue
-        ranks = _spawn(tp, pairs, time_it=False, grid_cap=args.grid_cap)
+        ranks = _spawn(
+            tp,
+            pairs,
+            time_it=False,
+            fill=("normal", *_MIXED_FILLS),
+            grid_cap=args.grid_cap,
+        )
         # N(0, 0.1) fits the E4M3 group scale everywhere.
         _assert_validity(
-            ranks,
+            _rows_for(ranks, "normal"),
             pairs=pairs,
             world_size=tp,
             label="validity",
             sqnr_min=IN_RANGE_SQNR_MIN_DB,
         )
+        _assert_in_range_precision(ranks, pairs=pairs, world_size=tp)
 
     if n_gpu < TP:
         aiter.logger.warning(
@@ -646,16 +660,18 @@ def main():
             ranks, pairs=_DIVISOR_SHAPES, world_size=TP, label="small default divisor"
         )
 
-        outlier = {}
-        for divisor in (1.0, _OUTLIER_DIVISOR):
-            outlier[divisor] = _spawn(
+        by_divisor = {
+            divisor: _spawn(
                 TP,
                 _DIVISOR_SHAPES,
                 time_it=False,
-                fill="outlier",
+                fill=("outlier", "above_fp16"),
                 grid_cap=args.grid_cap,
                 divisor=divisor,
             )
+            for divisor in (1.0, _OUTLIER_DIVISOR)
+        }
+        outlier = {d: _rows_for(r, "outlier") for d, r in by_divisor.items()}
         # CLOSE_ATOL is calibrated to the 0.1-std fill, not to std 100.
         _assert_validity(
             outlier[_OUTLIER_DIVISOR],
@@ -687,8 +703,11 @@ def main():
                     f"{_OUTLIER_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
                     "at divisor 1; the opt-in divisor should not cost precision"
                 )
-        _assert_above_fp16(TP, _DIVISOR_SHAPES, grid_cap=args.grid_cap)
-        _assert_in_range_precision(TP, _DIVISOR_SHAPES, grid_cap=args.grid_cap)
+        _assert_above_fp16(
+            {d: _rows_for(r, "above_fp16") for d, r in by_divisor.items()},
+            pairs=_DIVISOR_SHAPES,
+            world_size=TP,
+        )
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
