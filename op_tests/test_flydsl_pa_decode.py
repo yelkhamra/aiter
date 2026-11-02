@@ -166,19 +166,25 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_layout", ["same", "padded", "heads_first"])
 @pytest.mark.parametrize(
-    "mode,dim,scratch_offset,query_length,page",
+    "mode,dim,scratch_offset,query_length,page,group,kv_dtype",
     [
-        ("single", 128, 1, 3, 16),
+        ("single", 128, 1, 3, 16, 16, "bf16"),
         # D1024/MTP4 splits Q across CTAs; independent output strides must
         # also retain each split's MTP row offset in stores and empty clears.
-        ("single", 1024, 1, 4, 128),
-        ("last", 128, 0, 3, 16),
-        ("last", 128, 1, 1, 16),
-        ("last", 128, 2, 1, 16),
-        ("last", 128, 3, 1, 16),
-        ("cluster", 128, 1, 3, 16),
-        ("cluster", 384, 1, 1, 16),
-        ("reducer", 128, 1, 1, 16),
+        ("single", 1024, 1, 4, 128, 16, "bf16"),
+        ("last", 128, 0, 3, 16, 16, "bf16"),
+        ("last", 128, 1, 1, 16, 16, "bf16"),
+        ("last", 128, 2, 1, 16, 16, "bf16"),
+        ("last", 128, 3, 1, 16, 16, "bf16"),
+        ("cluster", 128, 1, 3, 16, 16, "bf16"),
+        ("cluster", 384, 1, 1, 16, 16, "bf16"),
+        ("reducer", 128, 1, 1, 16, 16, "bf16"),
+        # The FP8 wave-query pipeline keeps its reducer for independent output.
+        # Cover two different query/group combinations selecting that pipeline.
+        ("single", 128, 1, 4, 128, 16, "fp8"),
+        ("cluster", 128, 1, 4, 128, 16, "fp8"),
+        ("single", 128, 1, 5, 128, 12, "fp8"),
+        ("cluster", 128, 1, 5, 128, 12, "fp8"),
     ],
 )
 def test_pa_decode_merge_alignment(
@@ -189,6 +195,8 @@ def test_pa_decode_merge_alignment(
     scratch_offset,
     query_length,
     page,
+    group,
+    kv_dtype,
     dtype,
     output_layout,
 ):
@@ -203,8 +211,12 @@ def test_pa_decode_merge_alignment(
     if get_gfx_runtime() != "gfx1250":
         pytest.skip("gfx1250 tile-kernel partition merges")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    lengths = (1024, 17, 0) if mode == "cluster" else (1024, 17, 0, 0)
-    group = 16
+    # FP8 Q/P rounding on very short rows needs a different numerical oracle;
+    # use the existing canonical 65-token range for these layout-policy cases.
+    short_length = 65 if kv_dtype == "fp8" else 17
+    lengths = (
+        (1024, short_length, 0) if mode == "cluster" else (1024, short_length, 0, 0)
+    )
     query, key, value, table, context = _make_inputs(
         query_length, 1, group, dim, page, dtype, "random", device, lengths
     )
@@ -235,17 +247,21 @@ def test_pa_decode_merge_alignment(
         output_strides = query.stride()
         output_storage = torch.full_like(query_storage, float("nan"))
     output = output_storage[1:].as_strided(query.shape, output_strides)
+    if kv_dtype == "fp8":
+        key, key_scale = per_tensor_quant(key, quant_dtype=torch.float8_e4m3fn)
+        value, value_scale = per_tensor_quant(value, quant_dtype=torch.float8_e4m3fn)
+        vec = 16
+    else:
+        key, value = key.to(torch.bfloat16), value.to(torch.bfloat16)
+        key_scale = value_scale = None
+        vec = 8
+    key_reference = key.float() * (1 if key_scale is None else key_scale)
+    value_reference = value.float() * (1 if value_scale is None else value_scale)
     key_cache = (
-        key.to(torch.bfloat16)
-        .reshape(-1, 1, page, dim // 8, 8)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
+        key.reshape(-1, 1, page, dim // vec, vec).permute(0, 1, 3, 2, 4).contiguous()
     )
     value_cache = (
-        value.to(torch.bfloat16)
-        .reshape(-1, 1, page // 8, 8, dim)
-        .permute(0, 1, 2, 4, 3)
-        .contiguous()
+        value.reshape(-1, 1, page // vec, vec, dim).permute(0, 1, 2, 4, 3).contiguous()
     )
     plan = pa.plan_pa_decode(
         context,
@@ -280,8 +296,8 @@ def test_pa_decode_merge_alignment(
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
     reference = _reference(
         query,
-        key.to(torch.bfloat16).float(),
-        value.to(torch.bfloat16).float(),
+        key_reference,
+        value_reference,
         table,
         context,
         query_length,
@@ -299,6 +315,8 @@ def test_pa_decode_merge_alignment(
             table,
             dim**-0.5,
             query_length,
+            key_scale=key_scale,
+            value_scale=value_scale,
             sinks=sinks,
             work_plan=plan,
             max_context_length=1024,
@@ -328,9 +346,14 @@ def test_pa_decode_merge_alignment(
         check(reference)
     last_arriver_eligible = mode == "last" and scratch_offset == 0
     last_arriver = last_arriver_eligible and output_layout == "same"
-    assert compile_kwargs[-1]["direct_output"] == (last_arriver or mode == "single")
+    wave_fallback = kv_dtype == "fp8" and output_layout != "same"
+    assert compile_kwargs[-1]["direct_output"] == (
+        (last_arriver or mode == "single") and not wave_fallback
+    )
     assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver_eligible or mode in ("single", "reducer") else 4
+        0
+        if wave_fallback or last_arriver_eligible or mode in ("single", "reducer")
+        else 4
     )
     assert compile_kwargs[-1]["output_strides_match"] == (output_layout == "same")
 
@@ -356,8 +379,8 @@ def test_pa_decode_merge_alignment(
         check(
             _reference(
                 query,
-                key.to(torch.bfloat16).float(),
-                value.to(torch.bfloat16).float(),
+                key_reference,
+                value_reference,
                 table,
                 context,
                 query_length,

@@ -657,25 +657,34 @@ def compile_gfx1250_pa_decode(
         if const_expr(t.direct_output):
             # One task per nonempty sequence; reduce_info supplies its packed slot.
             info = fx.recast_iter(fx.Int32, pmax)
-            # Every lane in the CTA reads the same plan entry. Preserve that
-            # uniformity through the remap and its conditional task load, so
-            # dependent page-table loads can use scalar memory in the mainloop.
-            count = fx.Int32(
-                fx.rocdl.readfirstlane(
-                    fx.Int32.ir_type, fx.Int32(info[task_slot * 2 + 1])
+            if const_expr(t.wave_query_tiles):
+                # Retain the FP8 wave pipeline's task-load/control-flow lowering.
+                # Moving empty clears changes this pipeline's compiler lowering.
+                count = fx.Int32(info[task_slot * 2 + 1])
+                task_slot = (count > 0).select(
+                    fx.Int32(info[task_slot * 2]), fx.Int32(0)
                 )
-            )
-            first = fx.Int32(
-                fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(info[task_slot * 2]))
-            )
-            # A trailing empty sequence's start can equal capacity. Its dummy
-            # task read must stay in bounds even though no compute consumes it.
-            task_slot = (count > 0).select(first, fx.Int32(0))
+            else:
+                # Every lane reads the same plan entry. Preserve uniformity so
+                # dependent page-table loads can use scalar memory.
+                count = fx.Int32(
+                    fx.rocdl.readfirstlane(
+                        fx.Int32.ir_type, fx.Int32(info[task_slot * 2 + 1])
+                    )
+                )
+                first = fx.Int32(
+                    fx.rocdl.readfirstlane(
+                        fx.Int32.ir_type, fx.Int32(info[task_slot * 2])
+                    )
+                )
+                # A trailing empty sequence's start can equal capacity; keep
+                # its unused dummy task read in bounds.
+                task_slot = (count > 0).select(first, fx.Int32(0))
         task = fx.ptr_load(
             fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
             result_type=fx.Vector.make_type(4, fx.Int32),
         )
-        if const_expr(t.direct_output):
+        if const_expr(t.direct_output and not t.wave_query_tiles):
             task = fx.Vector.from_elements(
                 [
                     fx.Int32(
@@ -741,7 +750,9 @@ def compile_gfx1250_pa_decode(
                 Gfx1250WavePipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
-        if const_expr(t.direct_output):  # noqa: SIM102
+        elif const_expr(t.direct_output and t.wave_query_tiles):
+            zero_output(gpu.block_id("x"), pout)
+        if const_expr(t.direct_output and not t.wave_query_tiles):  # noqa: SIM102
             # Keep count inside its compile-time specialization and clear empty
             # sequences after the active path's input-table reads.
             if count == 0:
