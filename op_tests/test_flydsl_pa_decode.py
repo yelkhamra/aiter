@@ -334,7 +334,7 @@ def test_pa_decode_merge_alignment(
     )
     assert compile_kwargs[-1]["output_strides_match"] == (output_layout == "same")
 
-    # Replays and in-place plan refresh must also use the independent output
+    # Replays must observe updated page tables as well as independent output
     # strides when task counts change from multi-partition to single and empty.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -345,6 +345,7 @@ def test_pa_decode_merge_alignment(
     with torch.cuda.graph(graph, stream=stream):
         launch()
     for length in (257, 0):
+        table.copy_(table.flip(1))
         context[0] = length
         pa.plan_pa_decode(context, 1, plan=plan, query_length=query_length)
         query.neg_()
@@ -1195,7 +1196,8 @@ def test_pa_decode(case, device, monkeypatch):
     check()
     _check_pipe_policy(pa, case, arch, compile_kwargs)
     if case["capture"]:
-        # Compile/allocate before capture; replay must observe changed query data.
+        # Compile/allocate before capture; replay must observe changed Q and
+        # page-table entries, including the single-partition direct path.
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
@@ -1206,6 +1208,7 @@ def test_pa_decode(case, device, monkeypatch):
             launch()
         for _ in range(2):
             query.neg_()
+            table.copy_(table.flip(1))
             output.fill_(float("nan"))
             graph.replay()
             check()

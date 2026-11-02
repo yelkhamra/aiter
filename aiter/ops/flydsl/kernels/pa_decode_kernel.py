@@ -657,14 +657,30 @@ def compile_gfx1250_pa_decode(
         if const_expr(t.direct_output):
             # One task per nonempty sequence; reduce_info supplies its packed slot.
             info = fx.recast_iter(fx.Int32, pmax)
-            count = fx.Int32(info[task_slot * 2 + 1])
+            # Every lane in the CTA reads the same plan entry. Preserve that
+            # uniformity through the remap and its conditional task load, so
+            # dependent page-table loads can use scalar memory in the mainloop.
+            count = fx.Int32(
+                fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(info[task_slot * 2 + 1]))
+            )
+            first = fx.Int32(
+                fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(info[task_slot * 2]))
+            )
             # A trailing empty sequence's start can equal capacity. Its dummy
             # task read must stay in bounds even though no compute consumes it.
-            task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
+            task_slot = (count > 0).select(first, fx.Int32(0))
         task = fx.ptr_load(
             fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
             result_type=fx.Vector.make_type(4, fx.Int32),
         )
+        if const_expr(t.direct_output):
+            task = fx.Vector.from_elements(
+                [
+                    fx.Int32(fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(task[i])))
+                    for i in range_constexpr(4)
+                ],
+                dtype=fx.Int32,
+            )
         active = fx.Int32(task[1]) < fx.Int32(task[2])
         if const_expr(t.direct_output):
             active = count > 0
@@ -721,8 +737,10 @@ def compile_gfx1250_pa_decode(
                 Gfx1250WavePipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
-        elif const_expr(t.direct_output):
-            zero_output(gpu.block_id("x"), pout)
+        if const_expr(t.direct_output):
+            # Clear empty sequences after the active path's input-table reads.
+            if count == 0:
+                zero_output(gpu.block_id("x"), pout)
         if const_expr(t.merge_partitions):
             # Empty sequences own no task. Capacity >= batch gives each one the
             # CTA at its index, which clears its rows.
