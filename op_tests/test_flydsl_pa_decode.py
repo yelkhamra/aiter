@@ -166,16 +166,19 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("output_layout", ["same", "padded", "heads_first"])
 @pytest.mark.parametrize(
-    "mode,dim,scratch_offset,query_length",
+    "mode,dim,scratch_offset,query_length,page",
     [
-        ("single", 128, 1, 3),
-        ("last", 128, 0, 3),
-        ("last", 128, 1, 1),
-        ("last", 128, 2, 1),
-        ("last", 128, 3, 1),
-        ("cluster", 128, 1, 3),
-        ("cluster", 384, 1, 1),
-        ("reducer", 128, 1, 1),
+        ("single", 128, 1, 3, 16),
+        # D1024/MTP4 splits Q across CTAs; independent output strides must
+        # also retain each split's MTP row offset in stores and empty clears.
+        ("single", 1024, 1, 4, 128),
+        ("last", 128, 0, 3, 16),
+        ("last", 128, 1, 1, 16),
+        ("last", 128, 2, 1, 16),
+        ("last", 128, 3, 1, 16),
+        ("cluster", 128, 1, 3, 16),
+        ("cluster", 384, 1, 1, 16),
+        ("reducer", 128, 1, 1, 16),
     ],
 )
 def test_pa_decode_merge_alignment(
@@ -185,6 +188,7 @@ def test_pa_decode_merge_alignment(
     dim,
     scratch_offset,
     query_length,
+    page,
     dtype,
     output_layout,
 ):
@@ -199,7 +203,7 @@ def test_pa_decode_merge_alignment(
         pytest.skip("gfx1250 tile-kernel partition merges")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     lengths = (1024, 17, 0) if mode == "cluster" else (1024, 17, 0, 0)
-    page, group = 16, 16
+    group = 16
     query, key, value, table, context = _make_inputs(
         query_length, 1, group, dim, page, dtype, "random", device, lengths
     )
