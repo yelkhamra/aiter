@@ -36,12 +36,13 @@ from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
-# The E5M2 group scale (bias 12, [2**-12, 1.75 * 2**19]) covers every fp16
-# extremum at divisor 1. The kernel divides by the divisor in fp32 before
-# narrowing to fp16 and restores the sum in fp32 before the bf16 store, so
-# the opt-in divisor extends the range to 65504 * divisor. The bounds only
-# limit the precision trade-off: a large divisor pushes small inputs toward
-# the bottom of the fp16 range.
+# The group scale is E4M3 where a slice fits and E5M2 (bias 12, [2**-12,
+# 1.75 * 2**19]) where it does not, which covers every fp16 extremum at
+# divisor 1. The kernel divides by the divisor in fp32 before narrowing to
+# fp16 and restores the sum in fp32 before the bf16 store, so the opt-in
+# divisor extends the range to 65504 * divisor. The bounds only limit the
+# precision trade-off: a large divisor pushes small inputs toward the bottom
+# of the fp16 range.
 DIVISOR_MIN = 2.0**-4
 DIVISOR_MAX = 128.0
 

@@ -3,8 +3,10 @@
 
 """gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
 
-INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
-group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
+INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is one
+signed 8-bit minifloat per 16-value group in the 128 B region: E4M3 when
+every group of a wave's 512-value slice fits [2**-6, 480], else E5M2. The
+per-slice format bits ride in the release sector. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``atoms / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
@@ -60,6 +62,12 @@ _RESIDENT_WGS_PER_CU = {
     (8, 1): 4,
     (8, 8): 6,
 }
+
+
+# Plain builds the compiler would otherwise allocate one VGPR granule past
+# their measured residency (the scale-format bookkeeping costs a few
+# registers); pin them like the fused builds.
+_PINNED_PLAIN = frozenset({(4, 8)})
 
 
 def clamp_grid_cap(
@@ -147,55 +155,70 @@ def _atom_f16_to_f32_scaled(atom, scale):
     return fx.Vector(atom).bitcast(fx.Float16).to(fx.Float32) * scale
 
 
-def _f32_to_e4m3(x):
-    """Pack f32 to a signed 8-bit scale: 1 sign, 5-bit exp (bias 12), 2-bit mantissa.
+# Group scale: a signed 8-bit minifloat, E4M3 (bias 7, magnitudes 2**-7 to
+# 480) or E5M2 (bias 12, 2**-12 to 1.75 * 2**19), chosen per wave slice.
+# E4M3 has one more mantissa bit; E5M2 covers every fp16 extremum.
+E4M3_MAX = 480.0
+# A slice whose largest group extremum is below this goes as E5M2, so tiny
+# rows are not floored at E4M3's 2**-7 minimum scale.
+E4M3_SLICE_MIN = 2.0**-6
 
-    The scale was E4M3 with bias 7, which spans only [2**-7, 480]: a group
-    whose extremum is above 480 saturated, and one below 2**-7 got the 2**-7
-    scale (step 2**-10), so small partial sums lost most of their bits. E5M2
-    with bias 12 spans [2**-12, 1.75 * 2**19]: every fp16 extremum fits, and
-    the smallest scale keeps 1/d below the fp16 max for the packed-fp16
-    quantizer. The byte, the layout and the instruction count are unchanged;
-    the function names keep "e4m3" for a small diff.
 
-    Decode is ``±(1 + m/4) * 2**(e - 12)`` for every ``e``, including 0
-    (no denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
+def _ballot(pred):
+    return fx.Int64(rocdl.ballot(T.i64, as_ir_value(pred)))
 
-    ``0x00`` is +0 only. Any other value that would land there (positive
-    underflow, or exactly ``2**-12``) is stored as ``0x01``. Negative
-    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps both exponent
-    and mantissa.
+
+def _slice_is_e5(ext):
+    """Wave-uniform format flag for this wave's 32 groups (512 values).
+
+    E5M2 when any group extremum exceeds E4M3's range, or when none reaches
+    ``E4M3_SLICE_MIN``; E4M3 otherwise.
     """
-    is_z = x == fx.Float32(0.0)
-    sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
-    bits = abs(x).bitcast(fx.Int32)
-    e = (bits.shrui(fx.Int32(23)) & fx.Int32(255)) - fx.Int32(127)
-    mant = bits & fx.Int32(0x7FFFFF)
-    m3 = (mant + fx.Int32(1 << 20)).shrui(fx.Int32(21))
-    carry = m3 == fx.Int32(4)
-    e = e + carry.select(fx.Int32(1), fx.Int32(0))
-    m3 = carry.select(fx.Int32(0), m3)
-    e4 = e + fx.Int32(12)
-    overflow = e4 > fx.Int32(31)
-    m3 = overflow.select(fx.Int32(3), m3)
-    e4 = (e4 < fx.Int32(0)).select(fx.Int32(0), overflow.select(fx.Int32(31), e4))
-    byte = sign | (e4 << fx.Int32(2)) | (m3 & fx.Int32(3))
-    return is_z.select(fx.Int32(0), (byte == fx.Int32(0)).select(fx.Int32(1), byte))
+    a = abs(ext)
+    big = _ballot(a > fx.Float32(E4M3_MAX))
+    some = _ballot(a >= fx.Float32(E4M3_SLICE_MIN))
+    return (big != fx.Int64(0)) | (some == fx.Int64(0))
 
 
-def _e4m3_to_f32(b):
-    is_z = b == fx.Int32(0)
-    sign = (b & fx.Int32(0x80)) != fx.Int32(0)
-    e4 = b.shrui(fx.Int32(2)) & fx.Int32(31)
-    m3 = b & fx.Int32(3)
-    mag_bits = ((e4 + fx.Int32(115)) << fx.Int32(23)) | (m3 << fx.Int32(21))
-    mag = mag_bits.bitcast(fx.Float32)
-    signed = sign.select(-mag, mag)
-    return is_z.select(fx.Float32(0.0), signed)
+def _encode_scale(x, is_e5):
+    """Signed E4M3 or E5M2 byte of the f32 group extremum *x*.
+
+    ``(bits + half) >> sh`` is ``exponent << mbits | mantissa``, rounded half
+    up, with a mantissa carry already in the exponent; subtracting
+    ``(127 - bias) << mbits`` rebiases it. Overflow saturates to ``0x7F``
+    (max finite, not NaN). Underflow keeps the rounded mantissa under a zero
+    exponent. ``0x00`` is +0 only: a positive byte that would land there is
+    stored as ``0x01``, while negative underflow keeps ``0x80``.
+    """
+    sh = is_e5.select(fx.Int32(21), fx.Int32(20))
+    half = is_e5.select(fx.Int32(1 << 20), fx.Int32(1 << 19))
+    off = is_e5.select(fx.Int32((127 - 12) << 2), fx.Int32((127 - 7) << 3))
+    mmax = is_e5.select(fx.Int32(3), fx.Int32(7))
+    v = (abs(x).bitcast(fx.Int32) + half).shrui(sh)
+    mag = v - off
+    mag = (mag < fx.Int32(0)).select(v & mmax, mag)
+    mag = (mag > fx.Int32(0x7F)).select(fx.Int32(0x7F), mag)
+    byte = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0)) | mag
+    byte = (byte == fx.Int32(0)).select(fx.Int32(1), byte)
+    return (x == fx.Float32(0.0)).select(fx.Int32(0), byte)
 
 
-def _pack_e4m3_word(e, lane):
-    """Four pair-E4M3 bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
+def _decode_step(b, is_e5):
+    """f32 INT4 step ``-scale / 8`` of scale byte *b*.
+
+    The 7 magnitude bits map straight into f32: ``(b & 0x7F) << (23 - mbits)``
+    plus the rebias, with the ``/ 8`` folded into the exponent and the sign
+    flipped. Byte 0 gives -0.0, the same as ``0.0 * -0.125``.
+    """
+    sh = is_e5.select(fx.Int32(21), fx.Int32(20))
+    bias = is_e5.select(fx.Int32((127 - 12 - 3) << 23), fx.Int32((127 - 7 - 3) << 23))
+    neg = ((b & fx.Int32(0x80)) ^ fx.Int32(0x80)) << fx.Int32(24)
+    bits = neg | (((b & fx.Int32(0x7F)) << sh) + bias)
+    return (b == fx.Int32(0)).select(fx.Float32(-0.0), bits.bitcast(fx.Float32))
+
+
+def _pack_scale_word(e, lane):
+    """Four pair-scale bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
     base = (lane // GROUP) * GROUP
     e0 = fx.Int32(gpu.shuffle_idx(e, base, WAVE))
     e1 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(2), WAVE))
@@ -203,10 +226,6 @@ def _pack_e4m3_word(e, lane):
     e3 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(6), WAVE))
     b = fx.Int32(0xFF)
     return (e0 & b) | ((e1 & b) << 8) | ((e2 & b) << 16) | ((e3 & b) << 24)
-
-
-def _e4m3_decoding_scale(e):
-    return _splat_f16x2(_e4m3_to_f32(e) * fx.Float32(-0.125))
 
 
 def _quant_atom_fp16(atom, enc_pk):
@@ -221,14 +240,16 @@ def _quant_atom_fp16(atom, enc_pk):
 
 
 def _codec_quant(atom, lane, tid):
+    """Quantize one atom: (packed nibbles, scale word, is_leader, is_e5)."""
     ext = _pair_signed_ext_f16(atom)
-    e = _f32_to_e4m3(ext)
-    d = _e4m3_to_f32(e) * fx.Float32(-0.125)
+    is_e5 = _slice_is_e5(ext)
+    e = _encode_scale(ext, is_e5)
+    d = _decode_step(e, is_e5)
     packed = _quant_atom_fp16(
         atom, _splat_f16x2(fx.Float32(1.0) / (d + fx.Float32(1e-7)))
     )
     is_leader = (tid % GROUP) == 0
-    return packed, _pack_e4m3_word(e, lane), is_leader
+    return packed, _pack_scale_word(e, lane), is_leader, is_e5
 
 
 def _codec_dequant(packed, scale, acc=None):
@@ -291,9 +312,18 @@ def _invalidate_l1():
     llvm.InlineAsmOp(None, [], "buffer_inv sc1", "", has_side_effects=True)
 
 
+# Per-slice scale-format bits in LDS. meta_out: up to 2 words per (wave,
+# destination), filled while packing and read by the release writer.
+# meta_in: up to 16 release words per source, written by the poller.
+META_OUT_I32 = (BLOCK // WAVE) * max(SUPPORTED_WORLDS) * 2
+META_IN_STRIDE = 16
+META_I32 = META_OUT_I32 + META_IN_STRIDE * max(SUPPORTED_WORLDS)
+
+
 @fx.struct
 class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
+    meta: fx.Array[fx.Int32, META_I32, 16]
 
 
 # One fp32 partial sum of squares per (wave, row) for the fused RMSNorm.
@@ -304,6 +334,7 @@ NORM_RED_F32 = (BLOCK // WAVE) * ATOMS
 class PackNormStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
     red: fx.Array[fx.Float32, NORM_RED_F32, 16]
+    meta: fx.Array[fx.Int32, META_I32, 16]
 
 
 # A 12-atom (48 KiB) tile holds four 12 KiB rows (bf16 hidden 6144), which
@@ -319,12 +350,14 @@ NORM_RED_F32_WIDE = (BLOCK // WAVE) * WIDE_ATOMS
 @fx.struct
 class PackStorageWide:
     pack: fx.Array[fx.Int32, PACK_I32_WIDE, 16]
+    meta: fx.Array[fx.Int32, META_I32, 16]
 
 
 @fx.struct
 class PackNormStorageWide:
     pack: fx.Array[fx.Int32, PACK_I32_WIDE, 16]
     red: fx.Array[fx.Float32, NORM_RED_F32_WIDE, 16]
+    meta: fx.Array[fx.Int32, META_I32, 16]
 
 
 NORM_LATENCY_WGS_PER_CU = 2
@@ -491,6 +524,24 @@ def make_quick_allreduce_int4_kernel(
     else:
         storage_cls = {DEFAULT_ATOMS: PackStorage, WIDE_ATOMS: PackStorageWide}[ATOMS]
 
+    # Scale-format bits: one per (wave, sub-tile, rank atom) a sender packs
+    # for a destination, META_BITS per wave. They ride in release-sector
+    # words 1..META_NW as (color & 0xFFFF) << 16 | 16 bits, so the poller
+    # receives them in the same spin and tells a torn line from a finished
+    # one. Up to 16 bits a chunk carries several waves; above, a wave spans
+    # several chunks.
+    META_BITS = super_tile * rank_atoms
+    META_WORDS = (META_BITS + 31) // 32
+    if META_BITS <= 16:
+        META_WPC = 16 // META_BITS
+        META_NW = (WAVES + META_WPC - 1) // META_WPC
+    else:
+        META_CPW = (META_BITS + 15) // 16
+        META_NW = WAVES * META_CPW
+    if META_NW > 15 or META_WORDS > 2:
+        raise ValueError(f"{META_BITS} format bits per wave do not fit the release")
+    META_NQ = (META_NW + 1 + 3) // 4
+
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def quick_allreduce_int4(
         rank: Int32,
@@ -516,6 +567,7 @@ def make_quick_allreduce_int4_kernel(
         quad_layout = fx.make_layout((QUADS_PER_WAVE, QUAD_LANES), (QUAD_LANES, 1))
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
+        wave_u = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(wave)))
 
         pack_layout = fx.make_layout((ATOMS, RANK_TILE_I32), (RANK_TILE_I32, 1))
         # 64 B NT sectors of one 1152 B rank-tile: (sector, lane-in-quad)
@@ -533,7 +585,7 @@ def make_quick_allreduce_int4_kernel(
             fx.make_layout((1, BLOCK), (1, 1)),
             fx.make_layout((1, 4), (1, 1)),
         ).get_slice(tid)
-        # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
+        # Four group-16 scale bytes share the i32 slot eight threads already own.
         scale_own_layout = fx.make_layout(
             (BLOCK // GROUP, GROUP // PAIR, PAIR), (GROUP, PAIR, 1)
         )
@@ -562,6 +614,7 @@ def make_quick_allreduce_int4_kernel(
         lds = fx.SharedAllocator().allocate(storage_cls).peek()
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
+        meta_ptr = lds.meta.ptr
 
         peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
         peers = [
@@ -804,7 +857,7 @@ def make_quick_allreduce_int4_kernel(
                     pkts.append(
                         _recv_quantized(
                             PHASE_ALL_GATHER,
-                            fx.Int32(atom // rank_atoms),
+                            atom // rank_atoms,
                             sub,
                             atom % rank_atoms,
                         )
@@ -895,7 +948,32 @@ def make_quick_allreduce_int4_kernel(
                     scale, pack, (slot, fx.Int32(SCALE_I32_OFF) + scale_slot)
                 )
 
-        def _pack_reduce_scatter(atoms):
+        def _meta_out(dest, w):
+            return (
+                meta_ptr
+                + (wave_u * fx.Int32(world_size) + fx.Int32(dest)) * fx.Int32(2)
+                + fx.Int32(w)
+            )
+
+        def _meta_put(sub, dest, bits):
+            """OR this wave's format bits for sub-tile *sub* into its record.
+
+            One 64-bit record (two LDS words) per (wave, destination) holds bit
+            ``sub * rank_atoms + k``; sub-tile 0 starts it fresh. Lane 0 only,
+            and only this wave touches the record.
+            """
+            if lane == 0:
+                sub_i = fx.Int32(sub)
+                fresh = sub_i == fx.Int32(0)
+                pos = fx.Int64(sub_i * fx.Int32(rank_atoms))
+                val = fx.Int64(bits) << pos
+                for w in range_constexpr(META_WORDS):
+                    ptr = _meta_out(dest, w)
+                    old = fresh.select(fx.Int32(0), fx.Int32(fx.ptr_load(ptr)))
+                    part = fx.Int32(val.shrui(fx.Int64(32 * w)) & fx.Int64(0xFFFFFFFF))
+                    fx.ptr_store(old | part, ptr)
+
+        def _pack_reduce_scatter(atoms, sub):
             """Quantize each destination's slice of this tile into LDS.
 
             A 32 KiB tile is 8 atoms; destination *d* owns
@@ -903,27 +981,33 @@ def make_quick_allreduce_int4_kernel(
             are later NT-stored into *d*'s reduce-scatter inbox.
             """
             for dest in range_constexpr(world_size):
+                bits = fx.Int32(0)
                 for k in range_constexpr(rank_atoms):
-                    packed, scale, is_leader = _codec_quant(
+                    packed, scale, is_leader, is_e5 = _codec_quant(
                         atoms[dest * rank_atoms + k], lane, tid
                     )
                     _lds_write_packet(
                         fx.Int32(dest * rank_atoms + k), packed, scale, is_leader
                     )
+                    bits = bits | is_e5.select(fx.Int32(1 << k), fx.Int32(0))
+                _meta_put(sub, dest, bits)
 
-        def _pack_all_gather(accs):
+        def _pack_all_gather(accs, sub):
             """Quantize the reduced slice and replicate it for every peer.
 
             After reduce-scatter this rank holds ``rank_atoms`` reduced
             atoms. Copy the same packets into every destination slot so the
             NT fanout can push them into every peer's all-gather inbox.
             """
+            bits = fx.Int32(0)
             for k in range_constexpr(rank_atoms):
-                packed, scale, is_leader = _codec_quant(accs[k], lane, tid)
+                packed, scale, is_leader, is_e5 = _codec_quant(accs[k], lane, tid)
                 for dest in range_constexpr(world_size):
                     _lds_write_packet(
                         fx.Int32(dest * rank_atoms + k), packed, scale, is_leader
                     )
+                bits = bits | is_e5.select(fx.Int32(1 << k), fx.Int32(0))
+            _meta_put(sub, 0, bits)
 
         def _fanout_nt(phase, inbox_src, sub):
             """NT-store one rank-tile from LDS to every peer's inbox.
@@ -963,13 +1047,58 @@ def make_quick_allreduce_int4_kernel(
                         )
                         _store_v4i32_nt_global(dest + byte_off, v4)
 
+        def _release_words(phase, peer, color):
+            """This lane's 4 release words: color, then tagged format chunks.
+
+            Read from LDS before the drain: every wave's record was complete
+            at the pack barrier, and the next pack starts after a later one.
+            """
+            dsel = peer if phase == PHASE_REDUCE_SCATTER else fx.Int32(0)
+            tag = (fx.Int32(color) & fx.Int32(0xFFFF)) << fx.Int32(16)
+
+            def _rec(w, part):
+                ptr = (
+                    meta_ptr
+                    + (fx.Int32(w * world_size) + dsel) * fx.Int32(2)
+                    + fx.Int32(part)
+                )
+                return fx.Int32(fx.ptr_load(ptr))
+
+            words = [fx.Int32(color)] * 16
+            for j in range_constexpr(META_NW):
+                if const_expr(META_BITS <= 16):
+                    chunk = fx.Int32(0)
+                    for t in range_constexpr(META_WPC):
+                        w = j * META_WPC + t
+                        if const_expr(w < WAVES):
+                            v = _rec(w, 0) & fx.Int32((1 << META_BITS) - 1)
+                            chunk = chunk | (v << fx.Int32(t * META_BITS))
+                else:
+                    w, p = divmod(j, META_CPW)
+                    chunk = _rec(w, (16 * p) // 32).shrui(
+                        fx.Int32((16 * p) % 32)
+                    ) & fx.Int32(0xFFFF)
+                words[j + 1] = tag | chunk
+            out = []
+            for c in range_constexpr(4):
+                v = words[c]
+                for ln in range_constexpr(1, 4):
+                    if const_expr(4 * ln + c <= META_NW):
+                        v = (lane_in_quad == fx.Int32(ln)).select(words[4 * ln + c], v)
+                out.append(v)
+            return fx.Vector.from_elements(out, fx.Int32)
+
         def _publish(phase, inbox_src, color):
             """Drain payload NT stores, then write *color* into every peer inbox.
 
             Last 64 B of this rank's slot (after the ST rank-tiles) is the
-            handshake: 16 i32s all equal to *color*. Peers spin on that
-            sector in their copy of our slot; seeing *color* means our
-            payload is visible.
+            handshake: word 0 is *color*, words 1..META_NW carry this
+            release's scale-format bits tagged with the color's low 16 bits;
+            pollers ignore the rest. Peers spin on words 0..META_NW in their
+            copy of our slot; seeing *color* and every tag means our payload
+            and format bits are visible. The tag cannot alias: colors are
+            per workgroup and never 0, so a slot's stale release is always
+            this workgroup's previous color, whose low 16 bits differ.
 
             ``vmcnt(0)``: this 64-lane wave's NT payload stores are done.
             The workgroup barrier: the other three 64-lane waves issued
@@ -977,58 +1106,128 @@ def make_quick_allreduce_int4_kernel(
             wave-0 handshake could race stores still in flight. Neither
             can move after the color store, and neither can be dropped.
             """
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
             limit = fx.Int32(world_size)
             safe = (quad_id < limit).select(quad_id, fx.Int32(0))
+            v4 = _release_words(phase, safe, color)
+            rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
             if quad_id < limit:
                 vec_idx = fx.Int32(release_i32_off) + lane_in_quad * fx.Int32(4)
-                v4 = fx.full(4, fx.Int32(color), fx.Int32)
                 dest = peer_vec[safe]
                 byte_off = _i32_to_bytes(
                     _sub_tile_i32(phase, inbox_src, fx.Int32(0)) + vec_idx
                 )
                 _store_v4i32_nt_global(dest + byte_off, v4)
 
+        def _load_release(rsrc):
+            elems = []
+            for q in range_constexpr(META_NQ):
+                v = fx.Vector(
+                    buffer_ops.buffer_load(
+                        rsrc,
+                        fx.Int32(4 * q),
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=2,  # sc1, bypass L2
+                    )
+                )
+                for c in range_constexpr(4):
+                    elems.append(fx.Int32(v[c]))
+            rocdl.s_waitcnt(vmcnt=0)
+            return fx.Vector.from_elements(elems, fx.Int32)
+
+        def _release_seen(vv, color):
+            tag = fx.Int32(color) & fx.Int32(0xFFFF)
+            ok = fx.Int32(vv[0]) == fx.Int32(color)
+            for j in range_constexpr(1, META_NW + 1):
+                ok = ok & (fx.Int32(vv[j]).shrui(fx.Int32(16)) == tag)
+            return ok.select(fx.Int32(1), fx.Int32(0))
+
         def _wait_flag(flag_rsrc, color):
-            current = _load_i32_uncached(flag_rsrc)
-            while current != color:
-                current = _load_i32_uncached(flag_rsrc)
+            """Spin until the color and every format-chunk tag match."""
+            vv = _load_release(flag_rsrc)
+            seen = _release_seen(vv, color)
+            while seen == fx.Int32(0):
                 _invalidate_l1()
+                vv = _load_release(flag_rsrc)
+                seen = _release_seen(vv, color)
+            return vv
+
+        meta_state = {}
 
         def _wait_release(phase, color):
+            """Wait for every peer's release, then load this wave's format bits.
+
+            Poller thread *src* copies the format chunks into LDS before the
+            barrier; afterwards each wave reads its own bits for every source.
+            """
             if tid < world_size:
                 elem = _sub_tile_i32(phase, tid, fx.Int32(0)) + fx.Int32(
                     release_i32_off
                 )
-                _wait_flag(
+                vv = _wait_flag(
                     buffer_ops.create_buffer_resource_from_addr(
                         peer_vec[rank] + _i32_to_bytes(elem)
                     ),
                     color,
                 )
+                for j in range_constexpr(META_NW):
+                    fx.ptr_store(
+                        fx.Int32(vv[j + 1]) & fx.Int32(0xFFFF),
+                        meta_ptr
+                        + fx.Int32(META_OUT_I32 + j)
+                        + tid * fx.Int32(META_IN_STRIDE),
+                    )
             gpu.barrier()
+            masks = []
+            for src in range_constexpr(world_size):
+                row = meta_ptr + fx.Int32(META_OUT_I32 + src * META_IN_STRIDE)
+                if const_expr(META_BITS <= 16):
+                    c = wave_u // fx.Int32(META_WPC)
+                    sh = (wave_u % fx.Int32(META_WPC)) * fx.Int32(META_BITS)
+                    m = fx.Int32(fx.ptr_load(row + c)).shrui(sh) & fx.Int32(
+                        (1 << META_BITS) - 1
+                    )
+                    lo, hi = m, fx.Int32(0)
+                else:
+                    base = wave_u * fx.Int32(META_CPW)
+                    m = fx.Int64(0)
+                    for p in range_constexpr(META_CPW):
+                        ch = fx.Int64(fx.Int32(fx.ptr_load(row + base + fx.Int32(p))))
+                        m = m | (ch << fx.Int64(16 * p))
+                    lo = fx.Int32(m & fx.Int64(0xFFFFFFFF))
+                    hi = fx.Int32(m.shrui(fx.Int64(32)))
+                lo = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(lo)))
+                hi = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(hi)))
+                masks.append((lo, hi))
+            meta_state[phase] = masks
 
         def _recv_quantized(phase, src, sub, k=0):
             # Packed dword is at base+tid; scale dword is 1024 B later at a
             # group slot. They are not adjacent, so they cannot share one
             # vector load.
-            base = _sub_tile_i32(phase, src, sub)
+            base = _sub_tile_i32(phase, fx.Int32(src), sub)
             if k:
                 base = base + fx.Int32(k * RANK_TILE_I32)
             packed = _load_i32_nt(self_rsrc, base + tid)
             word = _load_i32_nt(self_rsrc, base + fx.Int32(SCALE_I32_OFF) + scale_slot)
             e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-            return packed, _e4m3_decoding_scale(e)
+            lo, hi = meta_state[phase][src]
+            idx = fx.Int32(sub) * fx.Int32(rank_atoms) + fx.Int32(k)
+            if const_expr(META_BITS <= 32):
+                bit = lo.shrui(idx) & fx.Int32(1)
+            else:
+                m = fx.Int64(lo) & fx.Int64(0xFFFFFFFF) | (fx.Int64(hi) << fx.Int64(32))
+                bit = fx.Int32(m.shrui(fx.Int64(idx)) & fx.Int64(1))
+            step = _decode_step(e, bit != fx.Int32(0))
+            return packed, _splat_f16x2(step)
 
         def _reduce_scattered(sub):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
             accs = [None] * rank_atoms
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    packed, scale = _recv_quantized(
-                        PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
-                    )
+                    packed, scale = _recv_quantized(PHASE_REDUCE_SCATTER, src, sub, k)
                     if accs[k] is None:
                         accs[k] = _codec_dequant(packed, scale)
                     else:
@@ -1044,9 +1243,7 @@ def make_quick_allreduce_int4_kernel(
             gathered = []
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    packed, scale = _recv_quantized(
-                        PHASE_ALL_GATHER, fx.Int32(src), sub, k
-                    )
+                    packed, scale = _recv_quantized(PHASE_ALL_GATHER, src, sub, k)
                     gathered.append(_codec_dequant(packed, scale))
             return gathered
 
@@ -1059,7 +1256,7 @@ def make_quick_allreduce_int4_kernel(
                 if const_expr(NORM_LATENCY):
                     res_pref = _prefetch_residual(tile)
                 atoms = _load_tile_atoms(tile)
-                _pack_reduce_scatter(atoms)
+                _pack_reduce_scatter(atoms, 0)
                 gpu.barrier()
                 _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
                 _publish(PHASE_REDUCE_SCATTER, rank, color)
@@ -1067,7 +1264,7 @@ def make_quick_allreduce_int4_kernel(
                 _wait_release(PHASE_REDUCE_SCATTER, color)
                 acc = _reduce_scattered(fx.Int32(0))
 
-                _pack_all_gather(acc)
+                _pack_all_gather(acc, 0)
                 gpu.barrier()
                 _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
                 _publish(PHASE_ALL_GATHER, rank, color)
@@ -1087,7 +1284,7 @@ def make_quick_allreduce_int4_kernel(
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * fx.Int32(grid)
                     atoms = _load_tile_atoms(tile)
-                    _pack_reduce_scatter(atoms)
+                    _pack_reduce_scatter(atoms, s)
                     gpu.barrier()
                     _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
@@ -1104,7 +1301,7 @@ def make_quick_allreduce_int4_kernel(
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     acc = _reduce_scattered(s)
-                    _pack_all_gather(acc)
+                    _pack_all_gather(acc, s)
                     gpu.barrier()
                     _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
@@ -1133,6 +1330,10 @@ def make_quick_allreduce_int4_kernel(
         # The host sizes the persistent grid from _RESIDENT_WGS_PER_CU, which
         # was measured on the plain kernel. One wave per SIMD per workgroup,
         # so pin the fused epilogue to the same VGPR budget.
+        value_attrs["rocdl.waves_per_eu"] = _RESIDENT_WGS_PER_CU[
+            (world_size, super_tile)
+        ]
+    elif (world_size, super_tile) in _PINNED_PLAIN:
         value_attrs["rocdl.waves_per_eu"] = _RESIDENT_WGS_PER_CU[
             (world_size, super_tile)
         ]
@@ -1192,7 +1393,7 @@ def make_quick_allreduce_int4_kernel(
         "tile_atoms": ATOMS,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
-        "lds_bytes": LDS_BYTES + (NORM_RED_F32 * 4 if fuse_norm else 0),
+        "lds_bytes": LDS_BYTES + (NORM_RED_F32 * 4 if fuse_norm else 0) + META_I32 * 4,
         "tile_bytes": TILE_BYTES,
         "tile_fp16": TILE_FP16,
         "rank_tile_bytes": RANK_TILE_BYTES,
